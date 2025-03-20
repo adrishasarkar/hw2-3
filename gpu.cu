@@ -9,7 +9,7 @@
 
 using namespace std;
 
-#define NUM_THREADS 16
+#define NUM_THREADS 128
 
 double bin_size; // bin_size = 2 * cutoff
 int bin_Dim;  // number of stacked bins in each direction.
