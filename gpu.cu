@@ -72,32 +72,100 @@ __device__ int get_bin_id_for_particle_gpu(particle_t* part, int bin_Dim, double
 }
 
 __global__ void compute_forces_gpu(particle_t* d_parts, int num_parts, int bin_Dim, int* d_part_ids_by_bin, int* d_bin_ids_prefix_sum, double bin_size) {
-    // Get thread (particle) ID
+    // Get thread (particle) ID based on global thread indexing
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= num_parts)
         return;
-
+    
+    // Declare shared memory for particles in the current block
+    extern __shared__ particle_t shared_parts[];
+    
+    // Get the actual particle ID from the binned array
     int part1_id = d_part_ids_by_bin[tid];
-    particle_t* particle_1_ptr = &d_parts[part1_id];
-    int bin_id = get_bin_id_for_particle_gpu(&d_parts[part1_id], bin_Dim, bin_size);
-    int bin_x_base = bin_id % bin_Dim;
-    int bin_y_base = bin_id / bin_Dim;
-
+    particle_t& my_particle = d_parts[part1_id];
+    
+    // Calculate bin coordinates directly to match your existing approach
+    int bin_x_base = (int)(my_particle.x / bin_size);
+    int bin_y_base = (int)(my_particle.y / bin_size);
+    
+    // Local accumulators to reduce atomic operations
+    double ax_local = 0.0;
+    double ay_local = 0.0;
+    
+    // Examine all neighboring bins (including the particle's own bin)
     for(int bin_dy = -1; bin_dy <= 1; bin_dy++){
         for(int bin_dx = -1; bin_dx <= 1; bin_dx++){
             int bin_x = bin_x_base + bin_dx;
             int bin_y = bin_y_base + bin_dy;
+            
+            // Skip bins that are out of bounds
             if(bin_x < 0 || bin_x >= bin_Dim || bin_y < 0 || bin_y >= bin_Dim)
                 continue;
+            
             int adj_bin_id = bin_x + bin_y * bin_Dim;
-            // Iterate over all particles in the 'adj_bin_id'
-            int n_parts_in_adj_bin = d_bin_ids_prefix_sum[adj_bin_id+1] - d_bin_ids_prefix_sum[adj_bin_id];
-            for(int part2_local_id = 0; part2_local_id < n_parts_in_adj_bin; part2_local_id++){
-                particle_t* particle_2_ptr = d_parts + d_part_ids_by_bin[d_bin_ids_prefix_sum[adj_bin_id] + part2_local_id];
-                apply_force_gpu(*particle_1_ptr, *particle_2_ptr);
+            
+            // Get range of particles in this bin using the prefix sum
+            int bin_start = d_bin_ids_prefix_sum[adj_bin_id];
+            int bin_end = d_bin_ids_prefix_sum[adj_bin_id+1];
+            int n_parts_in_adj_bin = bin_end - bin_start;
+            
+            // Skip empty bins
+            if (n_parts_in_adj_bin == 0)
+                continue;
+            
+            // Process particles in chunks that fit in shared memory
+            for (int chunk_start = 0; chunk_start < n_parts_in_adj_bin; chunk_start += blockDim.x) {
+                int chunk_size = min(blockDim.x, n_parts_in_adj_bin - chunk_start);
+                
+                // Collaboratively load particles into shared memory
+                if (threadIdx.x < chunk_size) {
+                    int particle_index = bin_start + chunk_start + threadIdx.x;
+                    int part_idx = d_part_ids_by_bin[particle_index];
+                    shared_parts[threadIdx.x] = d_parts[part_idx];
+                }
+                
+                // Ensure all threads have loaded their particles before proceeding
+                __syncthreads();
+                
+                // Process all particles in this chunk
+                for (int j = 0; j < chunk_size; j++) {
+                    // Get particle ID for self-interaction check
+                    int neighbor_idx = bin_start + chunk_start + j;
+                    int neighbor_part_id = d_part_ids_by_bin[neighbor_idx];
+                    
+                    // Skip self-interaction
+                    if (neighbor_part_id == part1_id)
+                        continue;
+                        
+                    // Access particle from shared memory
+                    particle_t& neighbor = shared_parts[j];
+                    
+                    // Apply force calculation - identical to original algorithm
+                    double dx = neighbor.x - my_particle.x;
+                    double dy = neighbor.y - my_particle.y;
+                    double r2 = dx * dx + dy * dy;
+                    
+                    if (r2 > cutoff * cutoff)
+                        continue;
+                    
+                    r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
+                    double r = sqrt(r2);
+                    
+                    // Same force calculation as original
+                    double coef = (1 - cutoff / r) / r2 / mass;
+                    ax_local += coef * dx;
+                    ay_local += coef * dy;
+                }
+                
+                // Ensure all threads are done with shared memory before next iteration
+                __syncthreads();
             }
         }
     }
+    
+    // Update the particle's acceleration with locally accumulated values
+    atomicAdd(&d_parts[part1_id].ax, ax_local);
+    atomicAdd(&d_parts[part1_id].ay, ay_local);
 }
 
 __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
@@ -256,10 +324,16 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 }
 
 void simulate_one_step(particle_t* d_parts, int num_parts, double size) {
-    // parts live in GPU memory
-    // Rewrite this function
+    // Rebin particles
     rebin_particles(d_parts, num_parts);
+    
+    // Reset forces
     reset_forces_gpu<<<blks, NUM_THREADS>>>(d_parts, num_parts);
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(d_parts, num_parts, bin_Dim, d_part_ids_by_bin, d_bin_ids_prefix_sum, bin_size);
+    
+    // Compute forces with shared memory
+    size_t shared_mem_size = NUM_THREADS * sizeof(particle_t);
+    compute_forces_gpu<<<blks, NUM_THREADS, shared_mem_size>>>(d_parts, num_parts, bin_Dim, d_part_ids_by_bin, d_bin_ids_prefix_sum, bin_size);
+    
+    // Move particles
     move_gpu<<<blks, NUM_THREADS>>>(d_parts, num_parts, size);
 }
