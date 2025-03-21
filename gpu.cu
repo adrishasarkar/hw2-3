@@ -192,7 +192,7 @@ __global__ void count_parts_in_bins(particle_t* d_parts, int num_parts, int* d_b
     }
 }
 
-__global__ void populate_bins(particle_t* d_parts, int* d_part_ids_by_bin, int* d_bin_positions, int num_parts, int bin_Dim, double bin_size){
+__global__ void populate_bins(particle_t* d_parts, int* d_part_ids_by_bin, int* d_bin_positions, int* d_prefix_sum, int num_parts, int bin_Dim, double bin_size){
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     
     if (tid >= num_parts)
@@ -206,7 +206,7 @@ __global__ void populate_bins(particle_t* d_parts, int* d_part_ids_by_bin, int* 
     int offset = atomicAdd(&d_bin_positions[bin_id], 1);
     
     // Add the starting position of this bin from the prefix sum
-    offset += d_bin_ids_prefix_sum[bin_id];
+    offset += d_prefix_sum[bin_id];
     
     // Store the particle ID at the claimed position
     d_part_ids_by_bin[offset] = part_id;
@@ -228,8 +228,8 @@ void rebin_particles(particle_t* d_parts, int num_parts){
     // Reset bin positions counter array
     cudaMemset(d_bin_positions, 0, num_bins*sizeof(int));
     
-    // Populate bins
-    populate_bins<<<blks, NUM_THREADS>>>(d_parts, d_part_ids_by_bin, d_bin_positions, num_parts, bin_Dim, bin_size);
+    // Populate bins - now passing the prefix sum array as a parameter
+    populate_bins<<<blks, NUM_THREADS>>>(d_parts, d_part_ids_by_bin, d_bin_positions, d_bin_ids_prefix_sum, num_parts, bin_Dim, bin_size);
     cudaDeviceSynchronize();  // Add synchronization
 }
 
