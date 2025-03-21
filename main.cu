@@ -8,6 +8,9 @@
 #include <random>
 #include <vector>
 
+// Declare the performance data function - add to gpu.h in your project
+void print_performance_data(int num_parts, double total_simulation_time);
+
 // =================
 // Helper Functions
 // =================
@@ -145,6 +148,10 @@ int main(int argc, char** argv) {
 
     // Finalize
     std::cout << "Simulation Time = " << seconds << " seconds for " << num_parts << " particles.\n";
+    
+    // Print performance breakdown analysis
+    print_performance_data(num_parts, seconds);
+    
     fsave.close();
     cudaFree(parts_gpu);
     delete[] parts;
