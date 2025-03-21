@@ -16,7 +16,6 @@ int bin_Dim;  // number of stacked bins in each direction.
 int num_bins; // = bin_Dim * bin_Dim
 int* d_part_ids_by_bin;
 int* d_bin_ids_prefix_sum;
-int* d_bin_positions; // Added for safe bin population
 
 // Put any static global variables here that you will use throughout the simulation.
 int blks;
@@ -33,25 +32,36 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
 
     //  very simple short-range repulsive force
     double coef = (1 - cutoff / r) / r2 / mass;
-    atomicAdd(&particle.ax, coef * dx);
-    atomicAdd(&particle.ay, coef * dy);
+    particle.ax += coef * dx;
+    particle.ay += coef * dy;
 }
 
-__global__ void reset_forces_gpu(particle_t* particles, int num_parts) {
+// Returns the bin_id given the particle - GPU version
+__device__ int get_bin_id_for_particle_gpu(particle_t* part, int bin_Dim, double bin_size){
+    int bin_x = min(bin_Dim - 1, max(0, (int)(part->x / bin_size)));
+    int bin_y = min(bin_Dim - 1, max(0, (int)(part->y / bin_size)));
+    return bin_x + bin_y * bin_Dim;
+}
+
+__global__ void count_parts_in_bins(particle_t* d_parts, int num_parts, int* d_bin_ids_prefix_sum, int bin_Dim, double bin_size){
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (tid >= num_parts)
+        return;
+
+    int bin_id = get_bin_id_for_particle_gpu(&d_parts[tid], bin_Dim, bin_size);
+    atomicAdd(&d_bin_ids_prefix_sum[bin_id+1], 1);
+}
+
+__global__ void populate_bins(particle_t* d_parts, int* d_part_ids_by_bin, int* d_bin_counts, int* d_bin_prefix_sum, int num_parts, int bin_Dim, double bin_size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     
     if (tid >= num_parts)
         return;
 
-    particles[tid].ax = particles[tid].ay = 0;
-}
-
-// Returns the bin_id given the particle - GPU version (safer version)
-__device__ int get_bin_id_for_particle_gpu(particle_t* part, int bin_Dim, double bin_size){
-    // Handle boundary conditions properly
-    int bin_x = min(bin_Dim - 1, max(0, (int)(part->x / bin_size)));
-    int bin_y = min(bin_Dim - 1, max(0, (int)(part->y / bin_size)));
-    return bin_x + bin_y * bin_Dim;
+    int bin_id = get_bin_id_for_particle_gpu(&d_parts[tid], bin_Dim, bin_size);
+    int offset = atomicAdd(&d_bin_counts[bin_id], 1);
+    d_part_ids_by_bin[d_bin_prefix_sum[bin_id] + offset] = tid;
 }
 
 __global__ void compute_forces_gpu(particle_t* d_parts, int num_parts, int bin_Dim, int* d_part_ids_by_bin, int* d_bin_ids_prefix_sum, double bin_size) {
@@ -64,16 +74,16 @@ __global__ void compute_forces_gpu(particle_t* d_parts, int num_parts, int bin_D
     extern __shared__ particle_t shared_parts[];
     
     // Get the actual particle ID from the binned array
-    int part1_id = d_part_ids_by_bin[tid];
+    int part1_id = tid;
     particle_t& my_particle = d_parts[part1_id];
     
-    // Calculate bin coordinates directly to match your existing approach
+    // Initialize forces to zero
+    my_particle.ax = 0;
+    my_particle.ay = 0;
+    
+    // Calculate bin coordinates for current particle
     int bin_x_base = min(bin_Dim - 1, max(0, (int)(my_particle.x / bin_size)));
     int bin_y_base = min(bin_Dim - 1, max(0, (int)(my_particle.y / bin_size)));
-    
-    // Local accumulators to reduce atomic operations
-    double ax_local = 0.0;
-    double ay_local = 0.0;
     
     // Examine all neighboring bins (including the particle's own bin)
     for(int bin_dy = -1; bin_dy <= 1; bin_dy++){
@@ -90,65 +100,14 @@ __global__ void compute_forces_gpu(particle_t* d_parts, int num_parts, int bin_D
             // Get range of particles in this bin using the prefix sum
             int bin_start = d_bin_ids_prefix_sum[adj_bin_id];
             int bin_end = d_bin_ids_prefix_sum[adj_bin_id+1];
-            int n_parts_in_adj_bin = bin_end - bin_start;
             
-            // Skip empty bins
-            if (n_parts_in_adj_bin == 0)
-                continue;
-            
-            // Process particles in chunks that fit in shared memory
-            for (int chunk_start = 0; chunk_start < n_parts_in_adj_bin; chunk_start += blockDim.x) {
-                int chunk_size = min(blockDim.x, n_parts_in_adj_bin - chunk_start);
-                
-                // Collaboratively load particles into shared memory
-                if (threadIdx.x < chunk_size) {
-                    int particle_index = bin_start + chunk_start + threadIdx.x;
-                    int part_idx = d_part_ids_by_bin[particle_index];
-                    shared_parts[threadIdx.x] = d_parts[part_idx];
-                }
-                
-                // Ensure all threads have loaded their particles before proceeding
-                __syncthreads();
-                
-                // Process all particles in this chunk
-                for (int j = 0; j < chunk_size; j++) {
-                    // Get particle ID for self-interaction check
-                    int neighbor_idx = bin_start + chunk_start + j;
-                    int neighbor_part_id = d_part_ids_by_bin[neighbor_idx];
-                    
-                    // Skip self-interaction
-                    if (neighbor_part_id == part1_id)
-                        continue;
-                        
-                    // Access particle from shared memory
-                    particle_t& neighbor = shared_parts[j];
-                    
-                    // Apply force calculation - identical to original algorithm
-                    double dx = neighbor.x - my_particle.x;
-                    double dy = neighbor.y - my_particle.y;
-                    double r2 = dx * dx + dy * dy;
-                    
-                    if (r2 > cutoff * cutoff)
-                        continue;
-                    
-                    r2 = (r2 > min_r * min_r) ? r2 : min_r * min_r;
-                    double r = sqrt(r2);
-                    
-                    // Same force calculation as original
-                    double coef = (1 - cutoff / r) / r2 / mass;
-                    ax_local += coef * dx;
-                    ay_local += coef * dy;
-                }
-                
-                // Ensure all threads are done with shared memory before next iteration
-                __syncthreads();
+            // Process all particles in this bin
+            for (int j = bin_start; j < bin_end; j++) {
+                int neighbor_id = d_part_ids_by_bin[j];
+                apply_force_gpu(my_particle, d_parts[neighbor_id]);
             }
         }
     }
-    
-    // Update the particle's acceleration with locally accumulated values
-    atomicAdd(&d_parts[part1_id].ax, ax_local);
-    atomicAdd(&d_parts[part1_id].ay, ay_local);
 }
 
 __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
@@ -176,71 +135,47 @@ __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
     }
 }
 
-__global__ void count_parts_in_bins(particle_t* d_parts, int num_parts, int* d_bin_ids_prefix_sum, int bin_Dim, double bin_size){
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    if (tid >= num_parts)
-        return;
-
-    int& part_id = tid;
-
-    int bin_id = get_bin_id_for_particle_gpu(&d_parts[part_id], bin_Dim, bin_size);
-
-    // Safety check for bin_id (shouldn't be needed with the improved get_bin_id function)
-    if (bin_id >= 0 && bin_id < bin_Dim * bin_Dim) {
-        atomicAdd(&d_bin_ids_prefix_sum[bin_id+1], 1);
-    }
-}
-
-__global__ void populate_bins(particle_t* d_parts, int* d_part_ids_by_bin, int* d_bin_positions, int* d_prefix_sum, int num_parts, int bin_Dim, double bin_size){
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    if (tid >= num_parts)
-        return;
-
-    int& part_id = tid;
-
-    int bin_id = get_bin_id_for_particle_gpu(&d_parts[part_id], bin_Dim, bin_size);
-
-    // Use temporary array for atomic operations to avoid disturbing prefix sum
-    int offset = atomicAdd(&d_bin_positions[bin_id], 1);
-    
-    // Add the starting position of this bin from the prefix sum
-    offset += d_prefix_sum[bin_id];
-    
-    // Store the particle ID at the claimed position
-    d_part_ids_by_bin[offset] = part_id;
-}
-
 void rebin_particles(particle_t* d_parts, int num_parts){
-    // Reset the prefix sum array to zeros
+    // Step 1: Reset the prefix sum array to zeros
     cudaMemset(d_bin_ids_prefix_sum, 0, (num_bins+1)*sizeof(int));
 
-    // Count particles per bin
+    // Step 2: Count particles per bin
     count_parts_in_bins<<<blks, NUM_THREADS>>>(d_parts, num_parts, d_bin_ids_prefix_sum, bin_Dim, bin_size);
-    cudaDeviceSynchronize();  // Add synchronization
+    cudaDeviceSynchronize();
 
-    // Compute exclusive prefix sum of bin counts
+    // Step 3: Compute exclusive prefix sum
     thrust::device_ptr<int> dev_ptr_begin(d_bin_ids_prefix_sum);
     thrust::device_ptr<int> dev_ptr_end(d_bin_ids_prefix_sum + num_bins + 1);
     thrust::exclusive_scan(thrust::device, dev_ptr_begin, dev_ptr_end, dev_ptr_begin);
     
-    // Reset bin positions counter array
-    cudaMemset(d_bin_positions, 0, num_bins*sizeof(int));
+    // Step 4: Create temporary array for counting during population
+    int* d_bin_counts;
+    cudaMalloc((void**)&d_bin_counts, num_bins * sizeof(int));
+    cudaMemset(d_bin_counts, 0, num_bins * sizeof(int));
     
-    // Populate bins - now passing the prefix sum array as a parameter
-    populate_bins<<<blks, NUM_THREADS>>>(d_parts, d_part_ids_by_bin, d_bin_positions, d_bin_ids_prefix_sum, num_parts, bin_Dim, bin_size);
-    cudaDeviceSynchronize();  // Add synchronization
+    // Step 5: Populate the bins array with particle IDs
+    populate_bins<<<blks, NUM_THREADS>>>(d_parts, d_part_ids_by_bin, d_bin_counts, d_bin_ids_prefix_sum, num_parts, bin_Dim, bin_size);
+    cudaDeviceSynchronize();
+    
+    // Free temporary array
+    cudaFree(d_bin_counts);
 }
 
 void allocate_gpu_memory(int num_parts, int num_bins) {
     cudaMalloc((void**)&d_part_ids_by_bin, num_parts * sizeof(int));
     cudaMalloc((void**)&d_bin_ids_prefix_sum, (num_bins+1) * sizeof(int));
-    // Add allocation for bin positions
-    cudaMalloc((void**)&d_bin_positions, num_bins * sizeof(int));
+}
+
+void free_gpu_memory() {
+    cudaFree(d_part_ids_by_bin);
+    cudaFree(d_bin_ids_prefix_sum);
 }
 
 void init_simulation(particle_t* parts, int num_parts, double size) {
+    // You can use this space to initialize data objects that you may need
+    // This function will be called once before the algorithm begins
+    // parts live in GPU memory
+    // Do not do any particle simulation here
     bin_size = 2 * cutoff;
     bin_Dim = ceil(size / bin_size);
     num_bins = bin_Dim * bin_Dim;
@@ -251,26 +186,15 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 }
 
 void simulate_one_step(particle_t* d_parts, int num_parts, double size) {
-    // Rebin particles
+    // First rebinning (sorting particles by spatial proximity)
     rebin_particles(d_parts, num_parts);
     
-    // Reset forces
-    reset_forces_gpu<<<blks, NUM_THREADS>>>(d_parts, num_parts);
-    cudaDeviceSynchronize();  // Add synchronization
-    
-    // Compute forces with shared memory
+    // Compute forces - now optimized with spatial binning
     size_t shared_mem_size = NUM_THREADS * sizeof(particle_t);
     compute_forces_gpu<<<blks, NUM_THREADS, shared_mem_size>>>(d_parts, num_parts, bin_Dim, d_part_ids_by_bin, d_bin_ids_prefix_sum, bin_size);
-    cudaDeviceSynchronize();  // Add synchronization
+    cudaDeviceSynchronize();
     
-    // Move particles
+    // Move particles - unchanged from reference
     move_gpu<<<blks, NUM_THREADS>>>(d_parts, num_parts, size);
-    cudaDeviceSynchronize();  // Add synchronization
-}
-
-// Add cleanup function to free GPU memory
-void cleanup_simulation() {
-    cudaFree(d_part_ids_by_bin);
-    cudaFree(d_bin_ids_prefix_sum);
-    cudaFree(d_bin_positions);
+    cudaDeviceSynchronize();
 }
